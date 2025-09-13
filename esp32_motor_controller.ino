@@ -250,6 +250,16 @@ void processAlarmCommand(AlarmData alarm) {
       stopMotor();
       Serial.println("Alarm toggled OFF - Motor stopped");
     }
+  } else if (alarm.action == "trigger") {
+    // Alarm triggered - start motor with high speed
+    startMotor();
+    setMotorSpeed(255); // Full speed for alarm trigger
+    Serial.println("🔔 ALARM TRIGGERED: " + alarm.label + " - Motor started at full speed!");
+    
+    // Optional: Run motor for a few seconds then stop
+    delay(3000); // Run for 3 seconds
+    stopMotor();
+    Serial.println("Alarm motor sequence completed");
   }
   
   updateStatusLED();

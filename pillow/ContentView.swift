@@ -47,7 +47,7 @@ enum Weekday: String, CaseIterable, Codable {
 // MARK: - Network Manager
 class NetworkManager: ObservableObject {
     @Published var isConnected = false
-    @Published var esp32IP = "192.168.4.1" // Default ESP32 hotspot IP
+    @Published var esp32IP = "192.168.4.1" // ESP32-C3 Access Point IP
     @Published var esp32Port = "80"
     @Published var lastResponse = ""
     @Published var connectionStatus = "Disconnected"
@@ -55,8 +55,23 @@ class NetworkManager: ObservableObject {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "NetworkMonitor")
     
+    // Persistent URLSession for ESP32 connection
+    private let urlSession: URLSession
+    private var baseURL: URL?
+    
     init() {
+        // Configure URLSession for persistent connections
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10.0
+        config.timeoutIntervalForResource = 30.0
+        config.httpMaximumConnectionsPerHost = 1
+        config.httpShouldUsePipelining = true
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        
+        self.urlSession = URLSession(configuration: config)
+        
         startNetworkMonitoring()
+        updateBaseURL()
     }
     
     private func startNetworkMonitoring() {
@@ -64,9 +79,27 @@ class NetworkManager: ObservableObject {
             DispatchQueue.main.async {
                 self?.isConnected = path.status == .satisfied
                 self?.connectionStatus = path.status == .satisfied ? "Connected" : "Disconnected"
+                
+                // Update base URL when connection status changes
+                if path.status == .satisfied {
+                    self?.updateBaseURL()
+                }
             }
         }
         monitor.start(queue: queue)
+    }
+    
+    private func updateBaseURL() {
+        baseURL = URL(string: "http://\(esp32IP):\(esp32Port)")
+        print("🔗 Updated base URL: \(baseURL?.absoluteString ?? "Invalid URL")")
+    }
+    
+    // Update ESP32 settings and refresh connection
+    func updateESP32Settings(ip: String, port: String) {
+        esp32IP = ip
+        esp32Port = port
+        updateBaseURL()
+        print("🔧 ESP32 settings updated: \(ip):\(port)")
     }
     
     func sendHTTPRequest(endpoint: String, method: String = "GET", body: Data? = nil, completion: @escaping (Result<String, Error>) -> Void) {
@@ -75,7 +108,8 @@ class NetworkManager: ObservableObject {
             return
         }
         
-        guard let url = URL(string: "http://\(esp32IP):\(esp32Port)\(endpoint)") else {
+        guard let baseURL = baseURL,
+              let url = URL(string: endpoint, relativeTo: baseURL) else {
             completion(.failure(NetworkError.invalidURL))
             return
         }
@@ -83,12 +117,16 @@ class NetworkManager: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("keep-alive", forHTTPHeaderField: "Connection")
         request.httpBody = body
         
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        print("📡 Sending \(method) request to: \(url.absoluteString)")
+        
+        urlSession.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 if let error = error {
                     self?.lastResponse = "Error: \(error.localizedDescription)"
+                    print("❌ Request failed: \(error.localizedDescription)")
                     completion(.failure(error))
                     return
                 }
@@ -98,6 +136,8 @@ class NetworkManager: ObservableObject {
                     let responseText = data.flatMap { String(data: $0, encoding: .utf8) } ?? "No response body"
                     self?.lastResponse = "Status: \(statusCode)\nResponse: \(responseText)"
                     
+                    print("📨 Response (\(statusCode)): \(responseText)")
+                    
                     if statusCode >= 200 && statusCode < 300 {
                         completion(.success(responseText))
                     } else {
@@ -105,6 +145,7 @@ class NetworkManager: ObservableObject {
                     }
                 } else {
                     self?.lastResponse = "Invalid response"
+                    print("❌ Invalid response received")
                     completion(.failure(NetworkError.invalidResponse))
                 }
             }
@@ -120,6 +161,42 @@ class NetworkManager: ObservableObject {
                 completion(false)
             }
         }
+    }
+    
+    // MARK: - ESP32 Command Methods
+    
+    func sendMotorCommand(action: String, completion: @escaping (Result<String, Error>) -> Void) {
+        let endpoint = "/motor/\(action)"
+        sendHTTPRequest(endpoint: endpoint, method: "POST", completion: completion)
+    }
+    
+    func setMotorSpeed(_ speed: Int, completion: @escaping (Result<String, Error>) -> Void) {
+        let speedData = ["speed": speed]
+        do {
+            let jsonData = try JSONSerialization.data(withJSONObject: speedData)
+            sendHTTPRequest(endpoint: "/motor/speed", method: "POST", body: jsonData, completion: completion)
+        } catch {
+            completion(.failure(error))
+        }
+    }
+    
+    func setMotorDirection(_ direction: Bool, completion: @escaping (Result<String, Error>) -> Void) {
+        let directionData = ["direction": direction]
+        do {
+            let jsonData = try JSONSerialization.data(withJSONObject: directionData)
+            sendHTTPRequest(endpoint: "/motor/direction", method: "POST", body: jsonData, completion: completion)
+        } catch {
+            completion(.failure(error))
+        }
+    }
+    
+    func getESP32Status(completion: @escaping (Result<String, Error>) -> Void) {
+        sendHTTPRequest(endpoint: "/status", method: "GET", completion: completion)
+    }
+    
+    // Clean up resources
+    deinit {
+        urlSession.invalidateAndCancel()
     }
 }
 
@@ -187,31 +264,31 @@ class AlarmManager: ObservableObject {
     }
     
     private func sendAlarmToESP32(_ alarm: Alarm, action: String) {
-        let alarmData: [String: Any] = [
-            "id": alarm.id.uuidString,
-            "time": ISO8601DateFormatter().string(from: alarm.time),
-            "label": alarm.label,
-            "enabled": alarm.isEnabled,
-            "repeatDays": Array(alarm.repeatDays.map { $0.rawValue }),
-            "action": action
-        ]
+        // Send simple status message to ESP32 based on action
+        let message: String
+        switch action {
+        case "add", "update", "toggle":
+            message = alarm.isEnabled ? "LED_ON" : "LED_OFF"
+        case "delete":
+            message = "LED_OFF"
+        default:
+            message = "GET_STATUS"
+        }
         
-        do {
-            let jsonData = try JSONSerialization.data(withJSONObject: alarmData)
-            networkManager.sendHTTPRequest(
-                endpoint: "/alarm",
-                method: "POST",
-                body: jsonData
-            ) { result in
-                switch result {
-                case .success(let response):
-                    print("ESP32 Response: \(response)")
-                case .failure(let error):
-                    print("ESP32 Error: \(error.localizedDescription)")
-                }
+        let endpoint = "/?message=\(message)"
+        
+        networkManager.sendHTTPRequest(
+            endpoint: endpoint,
+            method: "GET"
+        ) { result in
+            switch result {
+            case .success(let response):
+                // ESP32 received message successfully
+                print("📡 ESP32 Response (\(action)): \(response)")
+            case .failure(let error):
+                // ESP32 communication failed
+                print("❌ ESP32 Error (\(action)): \(error.localizedDescription)")
             }
-        } catch {
-            print("JSON serialization error: \(error)")
         }
     }
     
@@ -231,10 +308,14 @@ class AlarmManager: ObservableObject {
     // MARK: - Alarm Trigger Logic with Notifications
     private func requestNotificationPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
-            if granted {
-                print("Notification permission granted")
-            } else if let error = error {
-                print("Notification permission error: \(error)")
+            DispatchQueue.main.async {
+                if granted {
+                    print("✅ Notification permission granted - ready to send notifications")
+                } else if let error = error {
+                    print("❌ Notification permission error: \(error)")
+                } else {
+                    print("❌ Notification permission denied by user")
+                }
             }
         }
     }
@@ -252,9 +333,19 @@ class AlarmManager: ObservableObject {
         let currentTime = calendar.dateComponents([.hour, .minute], from: now)
         let currentWeekday = calendar.component(.weekday, from: now)
         
+        // Debug: Print current time and alarms
+        print("🕐 Checking alarms at: \(DateFormatter.localizedString(from: now, dateStyle: .none, timeStyle: .short))")
+        print("📋 Total alarms: \(alarms.count), Enabled: \(alarms.filter { $0.isEnabled }.count)")
+        
         for alarm in alarms {
-            if alarm.isEnabled && shouldTriggerAlarm(alarm, currentTime: currentTime, currentWeekday: currentWeekday) {
-                triggerAlarm(alarm)
+            if alarm.isEnabled {
+                let shouldTrigger = shouldTriggerAlarm(alarm, currentTime: currentTime, currentWeekday: currentWeekday)
+                print("🔍 Alarm '\(alarm.label)' at \(DateFormatter.localizedString(from: alarm.time, dateStyle: .none, timeStyle: .short)) - Should trigger: \(shouldTrigger)")
+                
+                if shouldTrigger {
+                    print("🚨 TRIGGERING ALARM: \(alarm.label)")
+                    triggerAlarm(alarm)
+                }
             }
         }
     }
@@ -279,9 +370,7 @@ class AlarmManager: ObservableObject {
     }
     
     private func triggerAlarm(_ alarm: Alarm) {
-        print("🔔 ALARM TRIGGERED: \(alarm.label) at \(alarm.time)")
-        
-        // Send notification
+        // Send notification to iPhone
         sendNotification(for: alarm)
         
         // Send to ESP32 (optional - for testing)
@@ -289,10 +378,13 @@ class AlarmManager: ObservableObject {
     }
     
     private func sendNotification(for alarm: Alarm) {
+        print("📱 Attempting to send notification for alarm: \(alarm.label)")
+        
         let content = UNMutableNotificationContent()
         content.title = "🔔 Alarm: \(alarm.label)"
         content.body = "Time: \(DateFormatter.localizedString(from: alarm.time, dateStyle: .none, timeStyle: .short))"
         content.sound = .default
+        content.badge = 1
         
         // Create a unique identifier for this alarm
         let identifier = "alarm_\(alarm.id.uuidString)"
@@ -303,37 +395,30 @@ class AlarmManager: ObservableObject {
         // Add the request
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
-                print("Error sending notification: \(error)")
+                print("❌ Notification error: \(error.localizedDescription)")
             } else {
-                print("Notification sent for alarm: \(alarm.label)")
+                print("✅ Notification sent successfully for alarm: \(alarm.label)")
             }
         }
     }
     
     private func sendAlarmTriggerToESP32(_ alarm: Alarm) {
-        let triggerData: [String: Any] = [
-            "type": "alarm_trigger",
-            "alarm_id": alarm.id.uuidString,
-            "label": alarm.label,
-            "timestamp": ISO8601DateFormatter().string(from: Date())
-        ]
+        // Send simple "LED_ON" message to ESP32
+        let message = "LED_ON"
+        let endpoint = "/?message=\(message)"
         
-        do {
-            let jsonData = try JSONSerialization.data(withJSONObject: triggerData)
-            networkManager.sendHTTPRequest(
-                endpoint: "/trigger",
-                method: "POST",
-                body: jsonData
-            ) { result in
-                switch result {
-                case .success(let response):
-                    print("Alarm trigger sent to ESP32: \(response)")
-                case .failure(let error):
-                    print("Failed to send alarm trigger to ESP32: \(error.localizedDescription)")
-                }
+        networkManager.sendHTTPRequest(
+            endpoint: endpoint,
+            method: "GET"
+        ) { result in
+            switch result {
+            case .success(let response):
+                // Alarm trigger sent to ESP32 successfully
+                print("🔔 ESP32 LED turned ON: \(response)")
+            case .failure(let error):
+                // Failed to send alarm trigger to ESP32
+                print("❌ ESP32 LED trigger error: \(error.localizedDescription)")
             }
-        } catch {
-            print("JSON serialization error for alarm trigger: \(error)")
         }
     }
     
@@ -382,6 +467,17 @@ struct ContentView: View {
                                     .font(.title3)
                                     .foregroundColor(networkManager.isConnected ? .green : .orange)
                             }
+                            
+                            // Test Notification Button
+                            Button(action: { 
+                                print("🔔 Test notification button tapped!")
+                                testNotification() 
+                            }) {
+                                Image(systemName: "bell")
+                                    .font(.title3)
+                                    .foregroundColor(.blue)
+                            }
+                            .buttonStyle(PlainButtonStyle())
                             
                             // Add Alarm Button
                             Button(action: { showingAddAlarm = true }) {
@@ -444,6 +540,68 @@ struct ContentView: View {
     private func deleteAlarms(offsets: IndexSet) {
         for index in offsets {
             alarmManager.deleteAlarm(alarmManager.alarms[index])
+        }
+    }
+    
+    private func testNotification() {
+        print("🧪 Testing notification...")
+        
+        // First check notification settings
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            print("📱 Notification settings:")
+            print("   - Authorization status: \(settings.authorizationStatus.rawValue)")
+            print("   - Alert setting: \(settings.alertSetting.rawValue)")
+            print("   - Sound setting: \(settings.soundSetting.rawValue)")
+            print("   - Badge setting: \(settings.badgeSetting.rawValue)")
+            
+            DispatchQueue.main.async {
+                if settings.authorizationStatus == .authorized {
+                    self.sendTestNotification()
+                } else if settings.authorizationStatus == .notDetermined {
+                    print("⚠️ Notification permission not determined - requesting permission...")
+                    self.requestNotificationPermissionAndTest()
+                } else {
+                    print("❌ Notifications not authorized - status: \(settings.authorizationStatus.rawValue)")
+                }
+            }
+        }
+    }
+    
+    private func sendTestNotification() {
+        print("📤 Sending test notification...")
+        
+        let content = UNMutableNotificationContent()
+        content.title = "🧪 Test Notification"
+        content.body = "This is a test notification from your alarm app!"
+        content.sound = .default
+        content.badge = 1
+        
+        let identifier = "test_notification_\(UUID().uuidString)"
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        
+        UNUserNotificationCenter.current().add(request) { error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    print("❌ Test notification error: \(error.localizedDescription)")
+                } else {
+                    print("✅ Test notification sent successfully!")
+                }
+            }
+        }
+    }
+    
+    private func requestNotificationPermissionAndTest() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            DispatchQueue.main.async {
+                if granted {
+                    print("✅ Notification permission granted - sending test notification")
+                    self.sendTestNotification()
+                } else if let error = error {
+                    print("❌ Notification permission error: \(error)")
+                } else {
+                    print("❌ Notification permission denied by user")
+                }
+            }
         }
     }
 }
@@ -790,7 +948,7 @@ struct NetworkSettingsView: View {
                 
                 // HTTP Test Buttons
                 VStack(spacing: 8) {
-                    Text("HTTP Tests")
+                    Text("ESP32 Message Tests")
                         .font(.headline)
                     
                     HStack(spacing: 12) {
@@ -799,8 +957,90 @@ struct NetworkSettingsView: View {
                         }
                         .buttonStyle(.bordered)
                         
-                        Button("POST /alarm") {
-                            sendTestRequest(endpoint: "/alarm", method: "POST", body: "{\"test\": true}")
+                        Button("LED_ON") {
+                            sendTestRequest(endpoint: "/?message=LED_ON", method: "GET")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    
+                    HStack(spacing: 12) {
+                        Button("LED_OFF") {
+                            sendTestRequest(endpoint: "/?message=LED_OFF", method: "GET")
+                        }
+                        .buttonStyle(.bordered)
+                        
+                        Button("PING") {
+                            sendTestRequest(endpoint: "/?message=PING", method: "GET")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    
+                    HStack(spacing: 12) {
+                        Button("HELLO") {
+                            sendTestRequest(endpoint: "/?message=HELLO", method: "GET")
+                        }
+                        .buttonStyle(.bordered)
+                        
+                        Button("BLINK_5") {
+                            sendTestRequest(endpoint: "/?message=BLINK_5", method: "GET")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                
+                // Motor Control Tests
+                VStack(spacing: 8) {
+                    Text("Motor Control Tests")
+                        .font(.headline)
+                    
+                    HStack(spacing: 12) {
+                        Button("Start Motor") {
+                            networkManager.sendMotorCommand(action: "start") { result in
+                                switch result {
+                                case .success(let response):
+                                    testResult = "✅ Motor started: \(response)"
+                                case .failure(let error):
+                                    testResult = "❌ Motor start failed: \(error.localizedDescription)"
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        
+                        Button("Stop Motor") {
+                            networkManager.sendMotorCommand(action: "stop") { result in
+                                switch result {
+                                case .success(let response):
+                                    testResult = "✅ Motor stopped: \(response)"
+                                case .failure(let error):
+                                    testResult = "❌ Motor stop failed: \(error.localizedDescription)"
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    
+                    HStack(spacing: 12) {
+                        Button("Speed 50%") {
+                            networkManager.setMotorSpeed(128) { result in
+                                switch result {
+                                case .success(let response):
+                                    testResult = "✅ Speed set: \(response)"
+                                case .failure(let error):
+                                    testResult = "❌ Speed set failed: \(error.localizedDescription)"
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        
+                        Button("Speed 100%") {
+                            networkManager.setMotorSpeed(255) { result in
+                                switch result {
+                                case .success(let response):
+                                    testResult = "✅ Speed set: \(response)"
+                                case .failure(let error):
+                                    testResult = "❌ Speed set failed: \(error.localizedDescription)"
+                                }
+                            }
                         }
                         .buttonStyle(.bordered)
                     }
@@ -819,8 +1059,7 @@ struct NetworkSettingsView: View {
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Save") {
-                        networkManager.esp32IP = tempIP
-                        networkManager.esp32Port = tempPort
+                        networkManager.updateESP32Settings(ip: tempIP, port: tempPort)
                         dismiss()
                     }
                     .fontWeight(.semibold)
