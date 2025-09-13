@@ -24,6 +24,14 @@ struct Alarm: Identifiable, Codable {
         self.isEnabled = isEnabled
         self.repeatDays = repeatDays
     }
+    
+    init(id: UUID, time: Date, label: String = "Alarm", isEnabled: Bool = true, repeatDays: Set<Weekday> = []) {
+        self.id = id
+        self.time = time
+        self.label = label
+        self.isEnabled = isEnabled
+        self.repeatDays = repeatDays
+    }
 }
 
 enum Weekday: String, CaseIterable, Codable {
@@ -670,6 +678,7 @@ struct EditAlarmView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Save") {
                         let updatedAlarm = Alarm(
+                            id: alarm.id,
                             time: selectedTime,
                             label: alarmLabel,
                             isEnabled: isEnabled,
