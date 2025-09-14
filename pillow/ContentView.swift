@@ -2,7 +2,6 @@
 //  ContentView.swift
 //  pillow
 //
-//  Created by Thomas Li on 9/13/25.
 //
 
 import SwiftUI
@@ -11,26 +10,30 @@ import Network
 import UserNotifications
 
 // MARK: - Alarm Model
-struct Alarm: Identifiable, Codable {
+struct Alarm: Identifiable, Codable, Hashable {
     var id = UUID()
     var time: Date
     var label: String
     var isEnabled: Bool
     var repeatDays: Set<Weekday>
-    
-    init(time: Date, label: String = "Alarm", isEnabled: Bool = true, repeatDays: Set<Weekday> = []) {
+    var intensity: Int // NEW
+
+    init(time: Date, label: String = "Alarm", isEnabled: Bool = true, repeatDays: Set<Weekday> = [], intensity: Int = 50) {
         self.time = time
         self.label = label
         self.isEnabled = isEnabled
         self.repeatDays = repeatDays
+        self.intensity = intensity;
     }
     
-    init(id: UUID, time: Date, label: String = "Alarm", isEnabled: Bool = true, repeatDays: Set<Weekday> = []) {
+    init(id: UUID, time: Date, label: String = "Alarm", isEnabled: Bool = true, repeatDays: Set<Weekday> = [], intensity: Int = 50) {
         self.id = id
         self.time = time
         self.label = label
         self.isEnabled = isEnabled
         self.repeatDays = repeatDays
+        self.intensity = intensity;
+
     }
 }
 
@@ -220,75 +223,119 @@ enum NetworkError: Error, LocalizedError {
     }
 }
 
+enum AlarmNotification {
+    static let categoryIdentifier = "ALARM_CATEGORY"
+    static let stopActionIdentifier = "STOP_ALARM"
+}
+
 // MARK: - Alarm Manager
-class AlarmManager: ObservableObject {
+class AlarmManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
+    
     @Published var alarms: [Alarm] = []
     private let networkManager: NetworkManager
     
-    // Alarm trigger logic with notifications for testing
-    private var alarmTimer: Timer?
-    
     init(networkManager: NetworkManager) {
         self.networkManager = networkManager
-        loadAlarms()
-        requestNotificationPermission()
-        startAlarmTimer()
+        super.init() // Call NSObject initializer
+        
+        // This is the new, more robust setup
+        configureNotifications { [weak self] in
+            self?.loadAlarms()
+            self?.scheduleAllEnabledAlarms()
+        }
+        UNUserNotificationCenter.current().delegate = self
+    }
+    
+    private func configureNotifications(completion: @escaping () -> Void) {
+        // Define the "Stop" action
+        let stopAction = UNNotificationAction(
+            identifier: AlarmNotification.stopActionIdentifier,
+            title: "Stop",
+            options: [.destructive, .foreground]
+        )
+        
+        // Define the category that includes the action
+        let category = UNNotificationCategory(
+            identifier: AlarmNotification.categoryIdentifier,
+            actions: [stopAction],
+            intentIdentifiers: [],
+            options: []
+        )
+        
+        let center = UNUserNotificationCenter.current()
+        
+        // Request authorization
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            DispatchQueue.main.async {
+                if granted {
+                    print("✅ Notification permission granted")
+                    // Now that we have permission, set the categories
+                    center.setNotificationCategories([category])
+                    print("✅ Notification category with 'Stop' action registered.")
+                    completion()
+                } else if let error = error {
+                    print("❌ Notification permission error: \(error)")
+                    completion() // Still call completion to load alarms
+                } else {
+                    print("❌ Notification permission denied")
+                    completion()
+                }
+            }
+        }
+    }
+    
+    private func scheduleAllEnabledAlarms() {
+        for alarm in alarms {
+            if alarm.isEnabled {
+                scheduleNotification(for: alarm)
+            }
+        }
     }
     
     func addAlarm(_ alarm: Alarm) {
         alarms.append(alarm)
         saveAlarms()
-        sendAlarmToESP32(alarm, action: "add")
+        if alarm.isEnabled {
+            scheduleNotification(for: alarm)
+        }
     }
     
     func updateAlarm(_ alarm: Alarm) {
         if let index = alarms.firstIndex(where: { $0.id == alarm.id }) {
+            // First, remove old notifications for this alarm
+            removeScheduledNotifications(for: alarms[index])
+            
+            // Then, update the alarm and schedule new notifications if enabled
             alarms[index] = alarm
             saveAlarms()
-            sendAlarmToESP32(alarm, action: "update")
+            if alarm.isEnabled {
+                scheduleNotification(for: alarm)
+            }
         }
     }
     
     func deleteAlarm(_ alarm: Alarm) {
         alarms.removeAll { $0.id == alarm.id }
+        removeScheduledNotifications(for: alarm)
         saveAlarms()
-        sendAlarmToESP32(alarm, action: "delete")
     }
     
-    func toggleAlarm(_ alarm: Alarm) {
+    // NEW public function to handle the toggle state change
+    func setAlarmEnabled(_ isEnabled: Bool, for alarm: Alarm) {
         if let index = alarms.firstIndex(where: { $0.id == alarm.id }) {
-            alarms[index].isEnabled.toggle()
-            saveAlarms()
-            sendAlarmToESP32(alarms[index], action: "toggle")
-        }
-    }
-    
-    private func sendAlarmToESP32(_ alarm: Alarm, action: String) {
-        // Send simple status message to ESP32 based on action
-        let message: String
-        switch action {
-        case "add", "update", "toggle":
-            message = alarm.isEnabled ? "LED_ON" : "LED_OFF"
-        case "delete":
-            message = "LED_OFF"
-        default:
-            message = "GET_STATUS"
-        }
-        
-        let endpoint = "/?message=\(message)"
-        
-        networkManager.sendHTTPRequest(
-            endpoint: endpoint,
-            method: "GET"
-        ) { result in
-            switch result {
-            case .success(let response):
-                // ESP32 received message successfully
-                print("📡 ESP32 Response (\(action)): \(response)")
-            case .failure(let error):
-                // ESP32 communication failed
-                print("❌ ESP32 Error (\(action)): \(error.localizedDescription)")
+            // Update the alarm's state
+            alarms[index].isEnabled = isEnabled
+            
+            if isEnabled {
+                // If it was just enabled, schedule a notification
+                scheduleNotification(for: alarms[index])
+            } else {
+                // If it was just disabled, remove notifications and send the "off" signal
+                removeScheduledNotifications(for: alarms[index])
+                sendAlarmOffToESP32(alarms[index])
             }
+            // Always save the updated state
+            saveAlarms()
         }
     }
     
@@ -306,79 +353,9 @@ class AlarmManager: ObservableObject {
     }
     
     // MARK: - Alarm Trigger Logic with Notifications
-    private func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
-            DispatchQueue.main.async {
-                if granted {
-                    print("✅ Notification permission granted - ready to send notifications")
-                } else if let error = error {
-                    print("❌ Notification permission error: \(error)")
-                } else {
-                    print("❌ Notification permission denied by user")
-                }
-            }
-        }
-    }
-    
-    private func startAlarmTimer() {
-        // Create a timer that checks every 10 seconds for testing (change to 60.0 for production)
-        alarmTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
-            self?.checkForAlarmsToTrigger()
-        }
-    }
-    
-    private func checkForAlarmsToTrigger() {
-        let now = Date()
-        let calendar = Calendar.current
-        let currentTime = calendar.dateComponents([.hour, .minute], from: now)
-        let currentWeekday = calendar.component(.weekday, from: now)
-        
-        // Debug: Print current time and alarms
-        print("🕐 Checking alarms at: \(DateFormatter.localizedString(from: now, dateStyle: .none, timeStyle: .short))")
-        print("📋 Total alarms: \(alarms.count), Enabled: \(alarms.filter { $0.isEnabled }.count)")
-        
-        for alarm in alarms {
-            if alarm.isEnabled {
-                let shouldTrigger = shouldTriggerAlarm(alarm, currentTime: currentTime, currentWeekday: currentWeekday)
-                print("🔍 Alarm '\(alarm.label)' at \(DateFormatter.localizedString(from: alarm.time, dateStyle: .none, timeStyle: .short)) - Should trigger: \(shouldTrigger)")
-                
-                if shouldTrigger {
-                    print("🚨 TRIGGERING ALARM: \(alarm.label)")
-                    triggerAlarm(alarm)
-                }
-            }
-        }
-    }
-    
-    private func shouldTriggerAlarm(_ alarm: Alarm, currentTime: DateComponents, currentWeekday: Int) -> Bool {
-        let alarmTime = Calendar.current.dateComponents([.hour, .minute], from: alarm.time)
-        
-        // Check if time matches
-        guard currentTime.hour == alarmTime.hour && currentTime.minute == alarmTime.minute else {
-            return false
-        }
-        
-        // Check repeat days
-        if alarm.repeatDays.isEmpty {
-            // One-time alarm - check if it's today
-            return true
-        } else {
-            // Repeating alarm - check if today is in repeat days
-            let todayWeekday = Weekday.allCases[currentWeekday - 1] // Calendar.weekday is 1-based
-            return alarm.repeatDays.contains(todayWeekday)
-        }
-    }
-    
-    private func triggerAlarm(_ alarm: Alarm) {
-        // Send notification to iPhone
-        sendNotification(for: alarm)
-        
-        // Send to ESP32 (optional - for testing)
-        sendAlarmTriggerToESP32(alarm)
-    }
-    
-    private func sendNotification(for alarm: Alarm) {
-        print("📱 Attempting to send notification for alarm: \(alarm.label)")
+    private func scheduleNotification(for alarm: Alarm) {
+        // Clear any existing notifications for this alarm
+        removeScheduledNotifications(for: alarm)
         
         let content = UNMutableNotificationContent()
         content.title = "🔔 Alarm: \(alarm.label)"
@@ -386,50 +363,201 @@ class AlarmManager: ObservableObject {
         content.sound = .default
         content.badge = 1
         
-        // Create a unique identifier for this alarm
-        let identifier = "alarm_\(alarm.id.uuidString)"
+        // This line is crucial to link the notification to the category with the 'Stop' button.
+        content.categoryIdentifier = AlarmNotification.categoryIdentifier
+        print("🔔 Notification content category identifier set to: \(content.categoryIdentifier)")
+
+        let calendar = Calendar.current
         
-        // Create the request
-        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
-        
-        // Add the request
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error = error {
-                print("❌ Notification error: \(error.localizedDescription)")
+        if alarm.repeatDays.isEmpty {
+            // One-time alarm
+            let now = Date()
+            
+            // Get the hour and minute from the alarm time
+            let alarmTimeComponents = calendar.dateComponents([.hour, .minute], from: alarm.time)
+            
+            // Combine with today's date
+            var triggerDateComponents = calendar.dateComponents([.year, .month, .day], from: now)
+            triggerDateComponents.hour = alarmTimeComponents.hour
+            triggerDateComponents.minute = alarmTimeComponents.minute
+            
+            var triggerDate = calendar.date(from: triggerDateComponents)!
+            
+            // If the alarm time has already passed today, schedule it for tomorrow
+            if triggerDate < now {
+                triggerDate = calendar.date(byAdding: .day, value: 1, to: triggerDate)!
+                print("⏰ Scheduling one-time alarm for tomorrow.")
             } else {
-                print("✅ Notification sent successfully for alarm: \(alarm.label)")
+                print("⏰ Scheduling one-time alarm for today.")
+            }
+            
+            // Use the full date components for the trigger
+            let finalDateComponents = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: triggerDate)
+            
+            let trigger = UNCalendarNotificationTrigger(dateMatching: finalDateComponents, repeats: false)
+            let identifier = "alarm_\(alarm.id.uuidString)"
+            let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
+            UNUserNotificationCenter.current().add(request) { error in
+                if let error = error {
+                    print("❌ Notification error: \(error.localizedDescription)")
+                } else {
+                    print("✅ One-time notification scheduled for: \(trigger.nextTriggerDate()?.description ?? "N/A")")
+                }
+            }
+        } else {
+            // Repeating alarm
+            for day in alarm.repeatDays {
+                var dateComponents = calendar.dateComponents([.hour, .minute, .second], from: alarm.time)
+                // Set weekday component (1-based, Sunday = 1)
+                dateComponents.weekday = Weekday.allCases.firstIndex(of: day)! + 1
+                
+                let trigger = UNCalendarNotificationTrigger(dateMatching: dateComponents, repeats: true)
+                let identifier = "alarm_\(alarm.id.uuidString)_\(day.rawValue)"
+                let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
+                
+                UNUserNotificationCenter.current().add(request) { error in
+                    if let error = error {
+                        print("❌ Repeating notification error for \(day.rawValue): \(error.localizedDescription)")
+                    } else {
+                        print("✅ Repeating notification for \(day.rawValue) scheduled for: \(trigger.nextTriggerDate()?.description ?? "N/A")")
+                    }
+                }
             }
         }
     }
     
+    private func removeScheduledNotifications(for alarm: Alarm) {
+        var identifiersToRemove = [String]()
+        if alarm.repeatDays.isEmpty {
+            // One-time alarm
+            identifiersToRemove.append("alarm_\(alarm.id.uuidString)")
+        } else {
+            // Repeating alarm
+            for day in alarm.repeatDays {
+                identifiersToRemove.append("alarm_\(alarm.id.uuidString)_\(day.rawValue)")
+            }
+        }
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: identifiersToRemove)
+        print("🗑️ Removed pending notifications for \(alarm.label) with identifiers: \(identifiersToRemove)")
+    }
+    
     private func sendAlarmTriggerToESP32(_ alarm: Alarm) {
-        // Send simple "LED_ON" message to ESP32
-        let message = "LED_ON"
-        let endpoint = "/?message=\(message)"
-        
+        // Build message in format: "<intensity> TRIGGER <label>"
+        let message = "\(alarm.intensity) TRIGGER \(alarm.label)"
+
+        // Encode message safely for URL
+        guard let encodedMessage = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            print("❌ Failed to encode message: \(message)")
+            return
+        }
+
+        let endpoint = "/?message=\(encodedMessage)"
+
         networkManager.sendHTTPRequest(
             endpoint: endpoint,
             method: "GET"
         ) { result in
             switch result {
             case .success(let response):
-                // Alarm trigger sent to ESP32 successfully
-                print("🔔 ESP32 LED turned ON: \(response)")
+                print("🔔 ESP32 Trigger Sent: \(response)")
             case .failure(let error):
-                // Failed to send alarm trigger to ESP32
-                print("❌ ESP32 LED trigger error: \(error.localizedDescription)")
+                print("❌ ESP32 Trigger Error: \(error.localizedDescription)")
             }
         }
     }
-    
+    private func sendAlarmOffToESP32(_ alarm: Alarm) {
+        // Build message in format: "<intensity> OFF <label>"
+        let message = "\(alarm.intensity) OFF \(alarm.label)"
+
+        // Encode message safely for URL
+        guard let encodedMessage = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            print("❌ Failed to encode message: \(message)")
+            return
+        }
+
+        let endpoint = "/?message=\(encodedMessage)"
+
+        networkManager.sendHTTPRequest(
+            endpoint: endpoint,
+            method: "GET"
+        ) { result in
+            switch result {
+            case .success(let response):
+                print("🛑 ESP32 OFF Sent: \(response)")
+            case .failure(let error):
+                print("❌ ESP32 OFF Error: \(error.localizedDescription)")
+            }
+        }
+    }
+
     deinit {
-        alarmTimer?.invalidate()
+        // Since we are now using system notifications, we no longer need to invalidate the timer here.
+    }
+    
+    // MARK: - UNUserNotificationCenterDelegate
+    // This method is called when a notification is delivered to the app while it's in the foreground.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        
+        // --- START NEW LOGIC ---
+        // Check if the notification is for an alarm and trigger the ESP32
+        let notificationIdentifier = notification.request.identifier
+        print("🔔 Notification presented in foreground: \(notificationIdentifier)")
+        
+        // Try to parse the UUID from the notification identifier
+        let components = notificationIdentifier.components(separatedBy: "_")
+        if components.count >= 2, components[0] == "alarm", let uuid = UUID(uuidString: components[1]) {
+            // Find the corresponding alarm in our list
+            if let alarmToTrigger = alarms.first(where: { $0.id == uuid }) {
+                print("Found alarm to trigger: \(alarmToTrigger.label)")
+                
+                // Send the "start" command to the ESP32
+                sendAlarmTriggerToESP32(alarmToTrigger)
+            }
+        }
+        // --- END NEW LOGIC ---
+
+        // Display the notification banner/sound/badge even if the app is in the foreground
+        completionHandler([.banner, .sound, .badge])
+    }
+    
+    // This method is called when the user interacts with a notification.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        
+        // Check if the action is our "Stop" button
+        if response.actionIdentifier == AlarmNotification.stopActionIdentifier {
+            let notificationIdentifier = response.notification.request.identifier
+            print("🛑 Stop button tapped for notification: \(notificationIdentifier)")
+            
+            // Try to parse the UUID from the notification identifier
+            let components = notificationIdentifier.components(separatedBy: "_")
+            if components.count >= 2, components[0] == "alarm", let uuid = UUID(uuidString: components[1]) {
+                // Find the corresponding alarm in our list
+                if let alarmToStop = alarms.first(where: { $0.id == uuid }) {
+                    print("Found alarm to stop: \(alarmToStop.label)")
+                    
+                    // Stop the alarm on the ESP32
+                    sendAlarmOffToESP32(alarmToStop)
+                    
+                    // Disable the alarm in the app
+                    if let index = alarms.firstIndex(where: { $0.id == uuid }) {
+                        alarms[index].isEnabled = false
+                        saveAlarms()
+                    }
+                }
+            } else {
+                print("❌ Could not parse alarm UUID from notification identifier.")
+            }
+        }
+        
+        // You must call the completion handler when you're done
+        completionHandler()
     }
 }
 
 // MARK: - Main Content View
 struct ContentView: View {
     @StateObject private var networkManager = NetworkManager()
+
     @StateObject private var alarmManager: AlarmManager
     @State private var showingAddAlarm = false
     @State private var showingNetworkSettings = false
@@ -469,9 +597,9 @@ struct ContentView: View {
                             }
                             
                             // Test Notification Button
-                            Button(action: { 
+                            Button(action: {
                                 print("🔔 Test notification button tapped!")
-                                testNotification() 
+                                testNotification()
                             }) {
                                 Image(systemName: "bell")
                                     .font(.title3)
@@ -519,8 +647,10 @@ struct ContentView: View {
                     }
                 } else {
                     List {
-                        ForEach(alarmManager.alarms) { alarm in
-                            AlarmRowView(alarm: alarm, alarmManager: alarmManager)
+                        // The ForEach loop now binds directly to each alarm in the array
+                        // to allow for direct modification.
+                        ForEach($alarmManager.alarms) { $alarm in
+                            AlarmRowView(alarm: $alarm, alarmManager: alarmManager)
                         }
                         .onDelete(perform: deleteAlarms)
                     }
@@ -575,6 +705,7 @@ struct ContentView: View {
         content.body = "This is a test notification from your alarm app!"
         content.sound = .default
         content.badge = 1
+        content.categoryIdentifier = AlarmNotification.categoryIdentifier // Ensure the category is set for the test notification as well
         
         let identifier = "test_notification_\(UUID().uuidString)"
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
@@ -608,7 +739,8 @@ struct ContentView: View {
 
 // MARK: - Alarm Row View
 struct AlarmRowView: View {
-    let alarm: Alarm
+    // The alarm is now a Binding, allowing direct modification from this view.
+    @Binding var alarm: Alarm
     let alarmManager: AlarmManager
     @State private var showingEditAlarm = false
     
@@ -623,7 +755,8 @@ struct AlarmRowView: View {
                     Text(alarm.label)
                         .font(.body)
                         .foregroundColor(alarm.isEnabled ? .primary : .secondary)
-                    
+                    Text("Intensity: \(alarm.intensity)").font(.caption) // NEW
+
                     if !alarm.repeatDays.isEmpty {
                         Text("•")
                             .foregroundColor(.secondary)
@@ -636,11 +769,13 @@ struct AlarmRowView: View {
             
             Spacer()
             
-            Toggle("", isOn: Binding(
-                get: { alarm.isEnabled },
-                set: { _ in alarmManager.toggleAlarm(alarm) }
-            ))
-            .toggleStyle(SwitchToggleStyle(tint: .orange))
+            Toggle("", isOn: $alarm.isEnabled)
+                .toggleStyle(SwitchToggleStyle(tint: .orange))
+                // This modifier listens for changes to the toggle's state
+                .onChange(of: alarm.isEnabled) { isNowEnabled in
+                    // Call the public method on the manager to handle the state change
+                    alarmManager.setAlarmEnabled(isNowEnabled, for: alarm)
+                }
         }
         .padding(.vertical, 8)
         .contentShape(Rectangle())
@@ -679,6 +814,8 @@ struct AddAlarmView: View {
     @State private var selectedTime = Date()
     @State private var alarmLabel = "Alarm"
     @State private var selectedDays: Set<Weekday> = []
+    @State private var intensityy = 5   // NEW
+
     
     var body: some View {
         NavigationView {
@@ -695,7 +832,14 @@ struct AddAlarmView: View {
                     TextField("Alarm", text: $alarmLabel)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
-                
+                Section(header: Text("Vibration Intensity")) {
+                    Slider(value: Binding(
+                        get: { Double(intensityy) },
+                        set: { intensityy = Int($0) }
+                    ), in: 1...10, step: 1)
+                    Text("Intensity: \(intensityy)")
+                }
+
                 // Repeat Days
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Repeat")
@@ -739,7 +883,9 @@ struct AddAlarmView: View {
                             time: selectedTime,
                             label: alarmLabel,
                             isEnabled: true,
-                            repeatDays: selectedDays
+                            repeatDays: selectedDays,
+                            intensity:
+                                intensityy
                         )
                         alarmManager.addAlarm(newAlarm)
                         dismiss()
@@ -761,6 +907,8 @@ struct EditAlarmView: View {
     @State private var alarmLabel: String
     @State private var selectedDays: Set<Weekday>
     @State private var isEnabled: Bool
+    @State private var intensity: Int
+
     
     init(alarm: Alarm, alarmManager: AlarmManager) {
         self.alarm = alarm
@@ -768,6 +916,7 @@ struct EditAlarmView: View {
         self._selectedTime = State(initialValue: alarm.time)
         self._alarmLabel = State(initialValue: alarm.label)
         self._selectedDays = State(initialValue: alarm.repeatDays)
+        self._intensity = State(initialValue: alarm.intensity)
         self._isEnabled = State(initialValue: alarm.isEnabled)
     }
     
@@ -786,7 +935,13 @@ struct EditAlarmView: View {
                     TextField("Alarm", text: $alarmLabel)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
-                
+                Section(header: Text("Vibration Intensity")) {
+                                Slider(value: Binding(
+                                    get: { Double(intensity) },
+                                    set: { intensity = Int($0) }
+                                ), in: 1...10, step: 1)
+                                Text("Intensity: \(intensity)")
+                            }
                 // Repeat Days
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Repeat")
@@ -840,7 +995,8 @@ struct EditAlarmView: View {
                             time: selectedTime,
                             label: alarmLabel,
                             isEnabled: isEnabled,
-                            repeatDays: selectedDays
+                            repeatDays: selectedDays,
+                            intensity: intensity
                         )
                         alarmManager.updateAlarm(updatedAlarm)
                         dismiss()
@@ -861,6 +1017,9 @@ struct NetworkSettingsView: View {
     @State private var isTestingConnection = false
     @State private var testResult = ""
     
+    // New state variables for the alarm controls
+    @State private var alarmIntensity: Double = 5.0
+
     init(networkManager: NetworkManager) {
         self.networkManager = networkManager
         self._tempIP = State(initialValue: networkManager.esp32IP)
@@ -946,103 +1105,37 @@ struct NetworkSettingsView: View {
                     }
                 }
                 
-                // HTTP Test Buttons
+                // Alarm Control Section
                 VStack(spacing: 8) {
-                    Text("ESP32 Message Tests")
+                    Text("Manual Alarm Control")
                         .font(.headline)
                     
-                    HStack(spacing: 12) {
-                        Button("GET /status") {
-                            sendTestRequest(endpoint: "/status", method: "GET")
+                    // Intensity Slider
+                    VStack(alignment: .leading) {
+                        HStack {
+                            Text("Intensity")
+                            Spacer()
+                            Text("\(Int(alarmIntensity))%")
                         }
-                        .buttonStyle(.bordered)
-                        
-                        Button("LED_ON") {
-                            sendTestRequest(endpoint: "/?message=LED_ON", method: "GET")
-                        }
-                        .buttonStyle(.bordered)
+                        Slider(value: $alarmIntensity, in: 0...10, step: 1)
+                            .tint(.orange)
                     }
                     
                     HStack(spacing: 12) {
-                        Button("LED_OFF") {
-                            sendTestRequest(endpoint: "/?message=LED_OFF", method: "GET")
+                        // Turn Alarm ON Button
+                        Button("Turn Alarm ON") {
+                            sendAlarmCommand(action: "trigger", intensity:Int(alarmIntensity))
+
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.green)
                         
-                        Button("PING") {
-                            sendTestRequest(endpoint: "/?message=PING", method: "GET")
+                        // Turn Alarm OFF Button
+                        Button("Turn Alarm OFF") {
+                            sendAlarmCommand(action: "OFF", intensity: 0)
                         }
-                        .buttonStyle(.bordered)
-                    }
-                    
-                    HStack(spacing: 12) {
-                        Button("HELLO") {
-                            sendTestRequest(endpoint: "/?message=HELLO", method: "GET")
-                        }
-                        .buttonStyle(.bordered)
-                        
-                        Button("BLINK_5") {
-                            sendTestRequest(endpoint: "/?message=BLINK_5", method: "GET")
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-                
-                // Motor Control Tests
-                VStack(spacing: 8) {
-                    Text("Motor Control Tests")
-                        .font(.headline)
-                    
-                    HStack(spacing: 12) {
-                        Button("Start Motor") {
-                            networkManager.sendMotorCommand(action: "start") { result in
-                                switch result {
-                                case .success(let response):
-                                    testResult = "✅ Motor started: \(response)"
-                                case .failure(let error):
-                                    testResult = "❌ Motor start failed: \(error.localizedDescription)"
-                                }
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        
-                        Button("Stop Motor") {
-                            networkManager.sendMotorCommand(action: "stop") { result in
-                                switch result {
-                                case .success(let response):
-                                    testResult = "✅ Motor stopped: \(response)"
-                                case .failure(let error):
-                                    testResult = "❌ Motor stop failed: \(error.localizedDescription)"
-                                }
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                    
-                    HStack(spacing: 12) {
-                        Button("Speed 50%") {
-                            networkManager.setMotorSpeed(128) { result in
-                                switch result {
-                                case .success(let response):
-                                    testResult = "✅ Speed set: \(response)"
-                                case .failure(let error):
-                                    testResult = "❌ Speed set failed: \(error.localizedDescription)"
-                                }
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        
-                        Button("Speed 100%") {
-                            networkManager.setMotorSpeed(255) { result in
-                                switch result {
-                                case .success(let response):
-                                    testResult = "✅ Speed set: \(response)"
-                                case .failure(let error):
-                                    testResult = "❌ Speed set failed: \(error.localizedDescription)"
-                                }
-                            }
-                        }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
                     }
                 }
                 
@@ -1078,14 +1171,24 @@ struct NetworkSettingsView: View {
         }
     }
     
-    private func sendTestRequest(endpoint: String, method: String, body: String? = nil) {
-        let bodyData = body?.data(using: .utf8)
-        networkManager.sendHTTPRequest(endpoint: endpoint, method: method, body: bodyData) { result in
+    private func sendAlarmCommand(action: String, intensity: Int) {
+        // Build message in format: "<intensity> <action> <label>"
+        let message = "\(intensity) \(action) Alarm"
+
+        // Encode message safely for URL
+        guard let encodedMessage = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            testResult = "❌ Failed to encode message."
+            return
+        }
+
+        let endpoint = "/?message=\(encodedMessage)"
+        
+        networkManager.sendHTTPRequest(endpoint: endpoint, method: "GET") { result in
             switch result {
             case .success(let response):
-                testResult = "✅ \(method) \(endpoint): \(response)"
+                testResult = "✅ Command sent: \(response)"
             case .failure(let error):
-                testResult = "❌ \(method) \(endpoint): \(error.localizedDescription)"
+                testResult = "❌ Command failed: \(error.localizedDescription)"
             }
         }
     }
@@ -1094,3 +1197,4 @@ struct NetworkSettingsView: View {
 #Preview {
     ContentView()
 }
+    
